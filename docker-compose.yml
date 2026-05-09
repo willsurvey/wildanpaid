@@ -1,0 +1,9 @@
+services:
+  radar-bursa:
+    build: .
+    container_name: radar-bursa
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./logs:/app/logs
