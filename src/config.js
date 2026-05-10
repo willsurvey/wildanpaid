@@ -130,6 +130,11 @@ const TELEGRAM = {
     WHALE:         process.env.TELEGRAM_TOPIC_WHALE || null,
     MOMENTUM:      process.env.TELEGRAM_TOPIC_MOMENTUM || null,
     DISTRIBUTION:  process.env.TELEGRAM_TOPIC_DISTRIBUTION || null,
+    LIVE_MONEY:    process.env.TELEGRAM_TOPIC_LIVE_MONEY || null,
+    LIVE_GAIN:     process.env.TELEGRAM_TOPIC_LIVE_GAIN || null,
+    LIVE_REBOUND:  process.env.TELEGRAM_TOPIC_LIVE_REBOUND || null,
+    LIVE_MF_MINUS: process.env.TELEGRAM_TOPIC_LIVE_MF_MINUS || null,
+    BIG_SMART_MONEY: process.env.TELEGRAM_TOPIC_BIG_SMART_MONEY || null,
   },
 
   // Rate limit Telegram: max 30 pesan/detik ke grup

@@ -15,6 +15,8 @@ const Streamer = require('./streamer');
 const AnalyticsEngine = require('./analytics');
 const Notifier = require('./notifier');
 const { createLogger } = require('./logger');
+const { startBSJPScheduler } = require('./bsjp-scheduler');
+const cron = require('node-cron');
 
 const log = createLogger('MAIN');
 
@@ -107,6 +109,17 @@ async function main() {
   });
 
   // 6. MULAI!
+  startBSJPScheduler();
+
+  // 7. Reset harian otomatis setiap hari Senin-Jumat jam 09:00 WIB
+  // Ini memastikan _dailyStats, _sessionLows, dan semua riwayat sinyal
+  // selalu fresh di awal sesi — data "09:00 - Now" menjadi akurat.
+  cron.schedule('0 9 * * 1-5', () => {
+    log.info('🌅 Reset harian dipicu (09:00 WIB). Membersihkan state analytics...');
+    analytics.resetDailyState();
+  }, { scheduled: true, timezone: 'Asia/Jakarta' });
+  log.info('📅 Daily reset scheduler aktif (Senin-Jumat 09:00 WIB)');
+
   analytics.start();
   await streamer.start();
 

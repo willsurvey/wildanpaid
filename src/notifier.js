@@ -54,8 +54,15 @@ class Notifier {
     const lastAlert = this._cooldowns.get(cooldownKey) || 0;
     const elapsed = Date.now() - lastAlert;
 
-    if (elapsed < TELEGRAM.COOLDOWN_MS) {
-      const remaining = ((TELEGRAM.COOLDOWN_MS - elapsed) / 1000).toFixed(0);
+    let cooldownLimit = TELEGRAM.COOLDOWN_MS;
+    if (['LIVE_MONEY_FLOW', 'LIVE_GAIN', 'LIVE_REBOUND', 'LIVE_MF_MINUS'].includes(type)) {
+      cooldownLimit = 10_000;
+    } else if (type === 'BIG_SMART_MONEY') {
+      cooldownLimit = 60_000; // 1 menit untuk BIG_SMART_MONEY
+    }
+
+    if (elapsed < cooldownLimit) {
+      const remaining = ((cooldownLimit - elapsed) / 1000).toFixed(0);
       log.debug(
         `⏳ Cooldown aktif untuk ${cooldownKey} (${remaining}s tersisa)`
       );
@@ -85,6 +92,26 @@ class Notifier {
       case 'DISTRIBUTION_WARNING': 
         threadId = TELEGRAM.TOPICS.DISTRIBUTION; 
         message = this._formatDistributionWarning(signal);
+        break;
+      case 'LIVE_MONEY_FLOW':
+        threadId = TELEGRAM.TOPICS.LIVE_MONEY;
+        message = this._formatLiveMoneyFlow(signal);
+        break;
+      case 'LIVE_GAIN':
+        threadId = TELEGRAM.TOPICS.LIVE_GAIN;
+        message = this._formatLiveGain(signal);
+        break;
+      case 'LIVE_REBOUND':
+        threadId = TELEGRAM.TOPICS.LIVE_REBOUND;
+        message = this._formatLiveRebound(signal);
+        break;
+      case 'LIVE_MF_MINUS':
+        threadId = TELEGRAM.TOPICS.LIVE_MF_MINUS;
+        message = this._formatLiveMoneyOutFlow(signal);
+        break;
+      case 'BIG_SMART_MONEY':
+        threadId = TELEGRAM.TOPICS.BIG_SMART_MONEY;
+        message = this._formatBigSmartMoney(signal);
         break;
       default:
         log.warn(`⚠️ Tipe sinyal tidak dikenal: ${type}`);
@@ -198,6 +225,189 @@ class Notifier {
       `• Chg   : ${chgStr} (Tekanan Jual Massive)\n` +
       `\n` +
       `❌ *KESIMPULAN: STRONG DISTRIBUTION (Hindari!)*`
+    );
+  }
+
+  _keterangan() {
+    return (
+      `\n━━━━━━━━━━━━━━━━━━━━\n` +
+      `*Keterangan :*\n` +
+      `💧  : signal pertama keluar\n` +
+      `🔥  : signal keluar lagi sblm 1 menit\n` +
+      `💦  : signal keluar lagi diatas 1 menit\n` +
+      `⭐️  : signal saham gembel pertama keluar\n` +
+      `🌟  : signal saham gembel keluar lagi diatas 1 menit\n` +
+      `🟢  : Saham Likuid\n` +
+      `🔴  : Saham Tidak Likuid\n` +
+      `MF+/- : Money InFlow/OutFlow`
+    );
+  }
+
+  _keteranganRebound() {
+    return (
+      `\n━━━━━━━━━━━━━━━━━━━━\n` +
+      `*Keterangan :*\n` +
+      `💧  : signal pertama keluar\n` +
+      `🔥  : signal keluar lagi sblm 1 menit\n` +
+      `💦  : signal keluar lagi diatas 1 menit\n` +
+      `⭐️  : signal saham gembel pertama keluar\n` +
+      `🌟  : signal saham gembel keluar lagi diatas 1 menit\n` +
+      `🥵  : Signal sudah keluar di rebound kemudian turun lagi dari low sebelumnya dan masuk lagi ke signal rebound\n` +
+      `🟢  : Saham Likuid\n` +
+      `🔴  : Saham Tidak Likuid\n` +
+      `MF+/- : Money InFlow/OutFlow`
+    );
+  }
+
+  _formatLiveMoneyFlow(s) {
+    const liqStr = s.isLiquid ? '🟢' : '🔴';
+    const chgSign = s.pctChange >= 0 ? '+' : '';
+    const chgStr = `${chgSign}${s.pctChange.toFixed(1)}%`;
+    const inFlowStr = s.netInflow > 0 ? '+Rp ' + this._fmtRp(s.netInflow) : '-Rp ' + this._fmtRp(Math.abs(s.netInflow));
+    
+    return (
+      `${s.emoji} *LIVE MONEY FLOW+:* #${s.symbol}\n` +
+      `━━━━━━━━━━━━━━━━━━━━\n` +
+      `📈 Harga     : Rp ${s.price.toLocaleString('id-ID')} (${chgStr})\n` +
+      `⚖️ Net Flow  : MF ${inFlowStr}\n` +
+      `💧 Likuiditas: ${liqStr}\n` +
+      this._keterangan() + `\n` +
+      `\n` +
+      `👨🏻‍💻 _This 🔥live Money InFlow created by Artificial Intelligence_\n` +
+      `#Disclaimer On\n` +
+      `\n` +
+      `*DISCLAIMER!!*\n` +
+      `1. Live Money Inflow adalah filter berdasarkan system trading base on Artificial Intelligence yang saya buat, dan ini hanya sebuah filter untuk mendapatkan data saham-saham yang tengah naik bukan ajakan membeli atau menjual, keputusan membeli dan menjual tetap ditangan Anda.\n` +
+      `2. Lakukan analisa kembali informasi yang kami berikan sesuai analisa masing - masing.\n` +
+      `3. Trading dan Investasi Saham memiliki potensi untung dan rugi, Manage your Own Risk.\n` +
+      `4. Ingat tidak ada yang bisa menjamin keuntungan ataupun kerugian dalam dunia investasi atau trading saham.\n` +
+      `5. Analisa kami bisa benar dan juga tentunya bisa salah, Ingat!! Market Always Right.\n` +
+      `6. Ingat!! Ingat!! Ingat!! apabila sebuah saham ramai NEWS POSITIF, itu artinya ada yang lagi butuh EXIT LIQUIDITY.\n` +
+      `7. Jangan terlalu GREEDY atau terlalu FEAR dan Jangan lupa selalu bersyukur.`
+    );
+  }
+
+  _formatLiveGain(s) {
+    const liqStr = s.isLiquid ? '🟢' : '🔴';
+    const chgSign = s.pctChange >= 0 ? '+' : '';
+    const chgStr = `${chgSign}${s.pctChange.toFixed(1)}%`;
+    const inFlowStr = s.netInflow > 0 ? '+Rp ' + this._fmtRp(s.netInflow) : '-Rp ' + this._fmtRp(Math.abs(s.netInflow));
+    
+    return (
+      `${s.emoji} *LIVE GAIN:* #${s.symbol}\n` +
+      `━━━━━━━━━━━━━━━━━━━━\n` +
+      `📈 Harga     : Rp ${s.price.toLocaleString('id-ID')} (${chgStr})\n` +
+      `⚖️ Net Flow  : MF ${inFlowStr}\n` +
+      `💧 Likuiditas: ${liqStr}\n` +
+      this._keterangan() + `\n` +
+      `\n` +
+      `👨🏻‍💻 _This 🔥live Gain created by Artificial Intelligence_\n` +
+      `#Disclaimer On\n` +
+      `\n` +
+      `*DISCLAIMER!!*\n` +
+      `1. Live gain adalah filter berdasarkan system trading base on Artificial Intelligence yang saya buat, dan ini hanya sebuah filter untuk mendapatkan data saham-saham yang tengah naik bukan ajakan membeli atau menjual, keputusan membeli dan menjual tetap ditangan Anda.\n` +
+      `2. Lakukan analisa kembali informasi yang kami berikan sesuai analisa masing - masing.\n` +
+      `3. Trading dan Investasi Saham memiliki potensi untung dan rugi, Manage your Own Risk.\n` +
+      `4. Ingat tidak ada yang bisa menjamin keuntungan ataupun kerugian dalam dunia investasi atau trading saham.\n` +
+      `5. Analisa kami bisa benar dan juga tentunya bisa salah, Ingat!! Market Always Right.\n` +
+      `6. ingat!! Ingat!! Ingat!! apabila sebuah saham ramai NEWS POSITIF, itu artinya ada yang lagi butuh EXIT LIQUIDITY.\n` +
+      `6. Jangan terlalu GREEDY atau terlalu FEAR dan Jangan lupa selalu bersyukur.`
+    );
+  }
+
+  _formatLiveRebound(s) {
+    const liqStr = s.isLiquid ? '🟢' : '🔴';
+    const chgSign = s.pctChange >= 0 ? '+' : '';
+    const chgStr = `${chgSign}${s.pctChange.toFixed(1)}%`;
+    const inFlowStr = s.netInflow > 0 ? '+Rp ' + this._fmtRp(s.netInflow) : '-Rp ' + this._fmtRp(Math.abs(s.netInflow));
+    
+    return (
+      `${s.emoji} *LIVE REBOUND:* #${s.symbol}\n` +
+      `━━━━━━━━━━━━━━━━━━━━\n` +
+      `📈 Harga     : Rp ${s.price.toLocaleString('id-ID')} (${chgStr})\n` +
+      `⚖️ Net Flow  : MF ${inFlowStr}\n` +
+      `💧 Likuiditas: ${liqStr}\n` +
+      this._keteranganRebound() + `\n` +
+      `\n` +
+      `👨🏻‍💻 _This 🔥live rebound created by Artificial Intelligence_\n` +
+      `#Disclaimer On\n` +
+      `\n` +
+      `*DISCLAIMER!!*\n` +
+      `1. Live Rebound adalah filter berdasarkan system trading base on Artificial Intelligence yang saya buat, dan ini hanya sebuah filter untuk mendapatkan data saham-saham yang tengah naik bukan ajakan membeli atau menjual, keputusan membeli dan menjual tetap ditangan Anda.\n` +
+      `2. Lakukan analisa kembali informasi yang kami berikan sesuai analisa masing - masing.\n` +
+      `3. Trading dan Investasi Saham memiliki potensi untung dan rugi, Manage your Own Risk.\n` +
+      `4. Ingat tidak ada yang bisa menjamin keuntungan ataupun kerugian dalam dunia investasi atau trading saham.\n` +
+      `5. Analisa kami bisa benar dan juga tentunya bisa salah, Ingat!! Market Always Right.\n` +
+      `6. ingat!! Ingat!! Ingat!! apabila sebuah saham ramai NEWS POSITIF, itu artinya ada yang lagi butuh EXIT LIQUIDITY.\n` +
+      `6. Jangan terlalu GREEDY atau terlalu FEAR dan Jangan lupa selalu bersyukur.`
+    );
+  }
+
+  _formatLiveMoneyOutFlow(s) {
+    const liqStr = s.isLiquid ? '🟢' : '🔴';
+    const chgSign = s.pctChange >= 0 ? '+' : '';
+    const chgStr = `${chgSign}${s.pctChange.toFixed(1)}%`;
+    const inFlowStr = s.netInflow > 0 ? '+Rp ' + this._fmtRp(s.netInflow) : '-Rp ' + this._fmtRp(Math.abs(s.netInflow));
+    
+    return (
+      `${s.emoji} *LIVE MF-:* #${s.symbol}\n` +
+      `━━━━━━━━━━━━━━━━━━━━\n` +
+      `📈 Harga     : Rp ${s.price.toLocaleString('id-ID')} (${chgStr})\n` +
+      `⚖️ Net Flow  : MF ${inFlowStr}\n` +
+      `💧 Likuiditas: ${liqStr}\n` +
+      this._keterangan() + `\n` +
+      `\n` +
+      `👨🏻‍💻 _This 🔥live Money OutFlow created by Artificial Intelligence_\n` +
+      `#Disclaimer On\n` +
+      `\n` +
+      `*DISCLAIMER!!*\n` +
+      `1. Live Money Outflow adalah filter berdasarkan system trading base on Artificial Intelligence yang saya buat, dan ini hanya sebuah filter untuk mendapatkan data saham-saham yang tengah naik bukan ajakan membeli atau menjual, keputusan membeli dan menjual tetap ditangan Anda.\n` +
+      `2. Lakukan analisa kembali informasi yang kami berikan sesuai analisa masing - masing.\n` +
+      `3. Trading dan Investasi Saham memiliki potensi untung dan rugi, Manage your Own Risk.\n` +
+      `4. Ingat tidak ada yang bisa menjamin keuntungan ataupun kerugian dalam dunia investasi atau trading saham.\n` +
+      `5. Analisa kami bisa benar dan juga tentunya bisa salah, Ingat!! Market Always Right.\n` +
+      `6. ingat!! Ingat!! Ingat!! apabila sebuah saham ramai NEWS POSITIF, itu artinya ada yang lagi butuh EXIT LIQUIDITY.\n` +
+      `6. Jangan terlalu GREEDY atau terlalu FEAR dan Jangan lupa selalu bersyukur.`
+    );
+  }
+
+  _formatBigSmartMoney(s) {
+    const liqStr = s.isLiquid ? '🟢' : '🔴';
+    
+    const fmtShort = (val) => {
+        const absVal = Math.abs(val);
+        const sign = val < 0 ? '-' : (val > 0 ? '+' : '');
+        if (absVal >= 1_000_000_000_000) return sign + (absVal/1e12).toFixed(2) + 'T';
+        if (absVal >= 1_000_000_000) return sign + (absVal/1e9).toFixed(2) + 'M';
+        if (absVal >= 1_000_000) return sign + (absVal/1e6).toFixed(1) + 'Jt';
+        return sign + (absVal/1e3).toFixed(1) + 'K';
+    };
+
+    const chgSign = s.pctChange >= 0 ? '+' : '';
+    const cleanMoney = s.smartMoneyTotal - s.badMoneyTotal;
+    const totalMoney = s.smartMoneyTotal + s.badMoneyTotal;
+    const powerRatio = totalMoney > 0 ? (cleanMoney / totalMoney * 100).toFixed(2) : '0';
+    const status = cleanMoney > 0 ? '🟢 BUYER DOMINANT' : '🔴 SELLER DOMINANT';
+
+    return (
+      `🎯 *BIG SMART MONEY TRIGGER:* #${s.symbol}\n` +
+      `━━━━━━━━━━━━━━━━━━━━\n` +
+      `${s.triggerCount}🔥 #${s.symbol}\n` +
+      `📈 Harga  : Rp ${s.price.toLocaleString('id-ID')} (${chgSign}${s.pctChange.toFixed(2)}%)\n` +
+      `📊 Freq   : ${s.freq}x transaksi\n` +
+      `💰 Value  : Rp ${this._fmtRp(s.valueWindow)}\n` +
+      `⚖️ Avg MF : Rp ${this._fmtRp(s.avgMfWindow)}\n` +
+      `📈 MF+    : +Rp ${this._fmtRp(s.netInflowWindow)}\n` +
+      `🚦 Volume : ${liqStr}🔥\n` +
+      `\n` +
+      `-----------------------------------\n` +
+      `📊 MARKET ANALYST (09:00 - Now)\n` +
+      `👙 Smart Money : ${fmtShort(s.smartMoneyTotal)}\n` +
+      `🌪 Bad Money   : ${fmtShort(s.badMoneyTotal)}\n` +
+      `💰 Clean Money : ${fmtShort(cleanMoney)}\n` +
+      `⚖️ Status      : ${status}\n` +
+      `📈 Power Ratio : ${powerRatio}% (Clean/TotalVal)\n` +
+      `-----------------------------------`
     );
   }
 
