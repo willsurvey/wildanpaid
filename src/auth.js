@@ -221,7 +221,7 @@ async function getWsTradingKey() {
   try {
     const response = await axios.get(STOCKBIT.WS_KEY_URL, {
       headers: {
-        ...STOCKBIT.LOGIN_HEADERS,
+        ...STOCKBIT.API_HEADERS,
         Authorization: `Bearer ${_jwtToken}`,
       },
       timeout: 15_000,

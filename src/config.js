@@ -55,6 +55,24 @@ const STOCKBIT = {
     Referer: 'https://stockbit.com/',
   },
 
+  // Header lengkap untuk request API setelah login (identik Chrome — bypass anti-bot)
+  API_HEADERS: {
+    'accept': 'application/json',
+    'accept-language': 'en-US,en;q=0.9',
+    'origin': 'https://stockbit.com',
+    'priority': 'u=1, i',
+    'referer': 'https://stockbit.com/',
+    'sec-ch-ua': '"Google Chrome";v="147", "Not.A/Brand";v="8", "Chromium";v="147"',
+    'sec-ch-ua-mobile': '?0',
+    'sec-ch-ua-platform': '"Windows"',
+    'sec-fetch-dest': 'empty',
+    'sec-fetch-mode': 'cors',
+    'sec-fetch-site': 'same-site',
+    'user-agent':
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
+      'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36',
+  },
+
   // Retry & backoff
   MAX_LOGIN_ATTEMPTS: 3,
   LOGIN_TIMEOUT_MS: 30_000,
