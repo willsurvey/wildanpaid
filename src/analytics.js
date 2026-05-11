@@ -402,9 +402,79 @@ class AnalyticsEngine extends EventEmitter {
     return false;
   }
 
+  // =========================================================================
+  // Private: Session Phase & Threshold Helpers
+  // =========================================================================
+
+  /**
+   * Tentukan fase sesi berdasarkan jam WIB.
+   * OPENING  : 09:00–09:30 (no daily filter, window threshold lebih ketat)
+   * CLOSING  : 14:30–15:00 (threshold lebih longgar)
+   * NORMAL   : sisa waktu
+   */
+  _getSessionPhase(now) {
+    const wib  = new Date(now + 7 * 3600 * 1000); // UTC → WIB
+    const mins = wib.getUTCHours() * 60 + wib.getUTCMinutes();
+    if (mins >= 540 && mins < 570) return 'OPENING';  // 09:00 - 09:30
+    if (mins >= 870 && mins < 900) return 'CLOSING';  // 14:30 - 15:00
+    return 'NORMAL';
+  }
+
+  /**
+   * Kalkulasi threshold adaptif berdasarkan:
+   *   - Fase sesi (Opening/Normal/Closing)
+   *   - Momentum Continuation (50% discount jika sudah pernah signal hari ini)
+   * @param {string}  symbol      - Kode saham
+   * @param {number}  now         - Timestamp ms
+   * @param {Map}     historyMap  - Map riwayat sinyal tipe ini
+   * @returns {Object} { minValue, minInflow, minDominance, minDaily, dailyValue, hasHistory }
+   */
+  _getLiveThresholds(symbol, now, historyMap) {
+    const phase      = this._getSessionPhase(now);
+    const dStat      = this._dailyStats.get(symbol);
+    const dailyValue = dStat?.totalValue || 0;
+    const hasHistory = historyMap.has(symbol);
+    const discount   = hasHistory ? ANALYTICS.MOMENTUM_DISCOUNT : 1.0;
+
+    let minValue, minInflow, minDominance, minDaily;
+    switch (phase) {
+      case 'OPENING':
+        minValue     = ANALYTICS.LIVE_OPENING_MIN_VALUE;
+        minInflow    = ANALYTICS.LIVE_OPENING_NET_INFLOW;
+        minDominance = ANALYTICS.LIVE_BUY_DOMINANCE;
+        minDaily     = 0;  // Tidak ada filter harian saat opening
+        break;
+      case 'CLOSING':
+        minValue     = ANALYTICS.LIVE_CLOSING_MIN_VALUE;
+        minInflow    = ANALYTICS.LIVE_CLOSING_NET_INFLOW;
+        minDominance = ANALYTICS.LIVE_BUY_DOMINANCE;
+        minDaily     = ANALYTICS.LIVE_CLOSING_DAILY_MIN;
+        break;
+      default: // NORMAL
+        minValue     = ANALYTICS.LIVE_MIN_VALUE;
+        minInflow    = ANALYTICS.LIVE_NET_INFLOW_MIN;
+        minDominance = ANALYTICS.LIVE_BUY_DOMINANCE;
+        minDaily     = ANALYTICS.LIVE_DAILY_MIN_VALUE;
+    }
+
+    // Terapkan discount jika saham sudah panas (momentum continuation)
+    return {
+      minValue:    minValue    * discount,
+      minInflow:   minInflow   * discount,
+      minDominance,
+      minDaily,
+      dailyValue,
+      hasHistory,
+      dStat,
+    };
+  }
+
+  // =========================================================================
+  // Private: Deteksi Sinyal LIVE (Money Flow, Gain, Rebound, MF-)
+  // =========================================================================
+
   /**
    * Deteksi 4: Live Money Flow + (Deteksi aliran dana masuk secara real-time)
-   * Trigger: Net Inflow >= 100 Jt dan dominasi HK >= 60% dalam 1 menit.
    */
   _checkLiveMoneyFlow(symbol, now) {
     const window = this._windows.get(symbol);
@@ -414,61 +484,49 @@ class AnalyticsEngine extends EventEmitter {
     const recent = window.filter((t) => t.time >= cutoff);
     if (recent.length < 3) return;
 
-    // Filter: saham harus punya transaksi harian minimal (bukan saham sepi)
-    const dStat = this._dailyStats.get(symbol);
-    if (!dStat || dStat.totalValue < ANALYTICS.LIVE_DAILY_MIN_VALUE) return;
-
-    let totalBuyValue = 0;
-    let totalSellValue = 0;
-
+    let totalBuyValue = 0, totalSellValue = 0;
     for (const t of recent) {
       if (t.action === 1) totalBuyValue += t.value;
       else if (t.action === 2) totalSellValue += t.value;
     }
 
-    const netInflow = totalBuyValue - totalSellValue;
-    const totalValue = totalBuyValue + totalSellValue;
-    
+    const netInflow    = totalBuyValue - totalSellValue;
+    const totalValue   = totalBuyValue + totalSellValue;
     if (totalValue === 0) return;
     const buyDominance = totalBuyValue / totalValue;
-    const isLiquid = totalValue >= ANALYTICS.LIVE_MIN_VALUE;
+    const isLiquid     = totalValue >= ANALYTICS.LIVE_MIN_VALUE;
 
-    // Filter wajib liquid + threshold ketat
-    if (!isLiquid) return;
-    if (netInflow < ANALYTICS.LIVE_NET_INFLOW_MIN) return;
-    if (buyDominance < ANALYTICS.LIVE_BUY_DOMINANCE) return;
+    // Rising Star: bypass semua filter jika ada ledakan luar biasa
+    const isRisingStar = netInflow >= ANALYTICS.RISING_STAR_INFLOW_MIN
+                      && buyDominance >= ANALYTICS.RISING_STAR_DOMINANCE;
 
-    const lastTrade = recent[recent.length - 1];
-    const isGembel = lastTrade.price < 200;
-    
-    const history = this._signalHistory.get(symbol);
-    let emoji = '';
-    
-    if (!history) {
-      emoji = isGembel ? '⭐️' : '💧';
-    } else {
-      const diff = now - history.lastTime;
-      if (diff < 60_000) {
-        emoji = '🔥';
-      } else {
-        emoji = isGembel ? '🌟' : '💦';
-      }
+    if (!isRisingStar) {
+      const thresh = this._getLiveThresholds(symbol, now, this._signalHistory);
+      if (totalValue   < thresh.minValue)     return;
+      if (netInflow    < thresh.minInflow)    return;
+      if (buyDominance < thresh.minDominance) return;
+      if (thresh.dailyValue < thresh.minDaily) return;
     }
-    
+
+    const highConfidence = isRisingStar || netInflow >= ANALYTICS.HIGH_CONFIDENCE_INFLOW;
+    const lastTrade      = recent[recent.length - 1];
+    const isGembel       = lastTrade.price < 200;
+    const dStat          = this._dailyStats.get(symbol);
+
+    const history = this._signalHistory.get(symbol);
+    let emoji = !history ? (isGembel ? '⭐️' : '💧')
+              : (now - history.lastTime < 60_000) ? '🔥'
+              : (isGembel ? '🌟' : '💦');
+
     this._signalHistory.set(symbol, { lastTime: now });
 
     this._emitSignal('LIVE_MONEY_FLOW', {
-      symbol: symbol,
-      price: lastTrade.price,
-      netInflow: netInflow,
-      totalValue: totalValue,
-      buyDominance: buyDominance,
-      emoji: emoji,
-      isLiquid: isLiquid,
-      isGembel: isGembel,
+      symbol, price: lastTrade.price, netInflow, totalValue,
+      buyDominance, emoji, isLiquid, isGembel,
       pctChange: lastTrade.pctChange,
-      smartMoneyTotal: dStat.smartMoney,
-      badMoneyTotal: dStat.badMoney,
+      smartMoneyTotal: dStat?.smartMoney || 0,
+      badMoneyTotal:   dStat?.badMoney   || 0,
+      highConfidence,
     });
   }
 
@@ -485,56 +543,49 @@ class AnalyticsEngine extends EventEmitter {
     const recent = window.filter((t) => t.time >= cutoff);
     if (recent.length < 3) return;
 
-    // Filter: saham harus punya transaksi harian minimal
-    const dStat = this._dailyStats.get(symbol);
-    if (!dStat || dStat.totalValue < ANALYTICS.LIVE_DAILY_MIN_VALUE) return;
-
     const firstTrade = recent[0];
-    const lastTrade = recent[recent.length - 1];
+    const lastTrade  = recent[recent.length - 1];
+    if (!(lastTrade.price > firstTrade.price && lastTrade.pctChange > 0)) return;
 
-    if (lastTrade.price > firstTrade.price && lastTrade.pctChange > 0) {
-      let totalBuyValue = 0;
-      let totalSellValue = 0;
-      for (const t of recent) {
-        if (t.action === 1) totalBuyValue += t.value;
-        else if (t.action === 2) totalSellValue += t.value;
-      }
-      
-      const netInflow = totalBuyValue - totalSellValue;
-      const totalValue = totalBuyValue + totalSellValue;
-      const isLiquid = totalValue >= ANALYTICS.LIVE_MIN_VALUE;
-      const isGembel = lastTrade.price < 200;
-      
-      // Filter: wajib liquid, nilai transaksi harus besar
-      if (!isLiquid) return;
-      if (totalValue < ANALYTICS.LIVE_MIN_VALUE) return;
-
-      const history = this._signalHistoryGain.get(symbol);
-      let emoji = '';
-      
-      if (!history) {
-        emoji = isGembel ? '⭐️' : '💧';
-      } else {
-        const diff = now - history.lastTime;
-        if (diff < 60_000) emoji = '🔥';
-        else emoji = isGembel ? '🌟' : '💦';
-      }
-      
-      this._signalHistoryGain.set(symbol, { lastTime: now });
-
-      this._emitSignal('LIVE_GAIN', {
-        symbol: symbol,
-        price: lastTrade.price,
-        netInflow: netInflow,
-        totalValue: totalValue,
-        emoji: emoji,
-        isLiquid: isLiquid,
-        isGembel: isGembel,
-        pctChange: lastTrade.pctChange,
-        smartMoneyTotal: dStat.smartMoney,
-        badMoneyTotal: dStat.badMoney,
-      });
+    let totalBuyValue = 0, totalSellValue = 0;
+    for (const t of recent) {
+      if (t.action === 1) totalBuyValue += t.value;
+      else if (t.action === 2) totalSellValue += t.value;
     }
+
+    const netInflow  = totalBuyValue - totalSellValue;
+    const totalValue = totalBuyValue + totalSellValue;
+
+    // Rising Star: bypass semua filter jika ada ledakan luar biasa
+    const buyDominance = totalBuyValue / totalValue;
+    const isRisingStar = netInflow >= ANALYTICS.RISING_STAR_INFLOW_MIN
+                      && buyDominance >= ANALYTICS.RISING_STAR_DOMINANCE;
+
+    if (!isRisingStar) {
+      const thresh = this._getLiveThresholds(symbol, now, this._signalHistoryGain);
+      if (totalValue < thresh.minValue)         return;
+      if (thresh.dailyValue < thresh.minDaily)  return;
+    }
+
+    const highConfidence = isRisingStar || netInflow >= ANALYTICS.HIGH_CONFIDENCE_INFLOW;
+    const isLiquid       = totalValue >= ANALYTICS.LIVE_MIN_VALUE;
+    const isGembel       = lastTrade.price < 200;
+    const dStat          = this._dailyStats.get(symbol);
+
+    const history = this._signalHistoryGain.get(symbol);
+    let emoji = !history ? (isGembel ? '⭐️' : '💧')
+              : (now - history.lastTime < 60_000) ? '🔥'
+              : (isGembel ? '🌟' : '💦');
+
+    this._signalHistoryGain.set(symbol, { lastTime: now });
+
+    this._emitSignal('LIVE_GAIN', {
+      symbol, price: lastTrade.price, netInflow, totalValue,
+      emoji, isLiquid, isGembel, pctChange: lastTrade.pctChange,
+      smartMoneyTotal: dStat?.smartMoney || 0,
+      badMoneyTotal:   dStat?.badMoney   || 0,
+      highConfidence,
+    });
   }
 
   /**
@@ -551,12 +602,8 @@ class AnalyticsEngine extends EventEmitter {
     const recent = window.filter((t) => t.time >= cutoff);
     if (recent.length < 3) return;
 
-    // Filter: saham harus punya transaksi harian minimal
-    const dStat = this._dailyStats.get(symbol);
-    if (!dStat || dStat.totalValue < ANALYTICS.LIVE_DAILY_MIN_VALUE) return;
-
     const firstTrade = recent[0];
-    const lastTrade = recent[recent.length - 1];
+    const lastTrade  = recent[recent.length - 1];
     const sessionLow = this._sessionLows.get(symbol) || lastTrade.price;
 
     const history = this._signalHistoryRebound.get(symbol);
@@ -564,57 +611,55 @@ class AnalyticsEngine extends EventEmitter {
       history.hasDroppedBelow = true;
     }
 
-    const isBouncing = lastTrade.price > firstTrade.price;
+    const isBouncing   = lastTrade.price > firstTrade.price;
     const isNearBottom = lastTrade.price <= sessionLow * 1.03;
+    if (!(isBouncing && isNearBottom)) return;
 
-    if (isBouncing && isNearBottom) {
-      let totalBuyValue = 0;
-      let totalSellValue = 0;
-      for (const t of recent) {
-        if (t.action === 1) totalBuyValue += t.value;
-        else if (t.action === 2) totalSellValue += t.value;
-      }
-      
-      const netInflow = totalBuyValue - totalSellValue;
-      const totalValue = totalBuyValue + totalSellValue;
-      const isLiquid = totalValue >= ANALYTICS.LIVE_MIN_VALUE;
-      const isGembel = lastTrade.price < 200;
-      
-      // Filter: wajib liquid
-      if (!isLiquid) return;
-
-      let emoji = '';
-      if (!history) {
-        emoji = isGembel ? '⭐️' : '💧';
-      } else {
-        if (history.hasDroppedBelow) {
-          emoji = '🥵';
-        } else {
-          const diff = now - history.lastTime;
-          if (diff < 60_000) emoji = '🔥';
-          else emoji = isGembel ? '🌟' : '💦';
-        }
-      }
-      
-      this._signalHistoryRebound.set(symbol, { 
-        lastTime: now,
-        lowAtSignal: sessionLow,
-        hasDroppedBelow: false 
-      });
-
-      this._emitSignal('LIVE_REBOUND', {
-        symbol: symbol,
-        price: lastTrade.price,
-        netInflow: netInflow,
-        totalValue: totalValue,
-        emoji: emoji,
-        isLiquid: isLiquid,
-        isGembel: isGembel,
-        pctChange: lastTrade.pctChange,
-        smartMoneyTotal: dStat.smartMoney,
-        badMoneyTotal: dStat.badMoney,
-      });
+    let totalBuyValue = 0, totalSellValue = 0;
+    for (const t of recent) {
+      if (t.action === 1) totalBuyValue += t.value;
+      else if (t.action === 2) totalSellValue += t.value;
     }
+
+    const netInflow    = totalBuyValue - totalSellValue;
+    const totalValue   = totalBuyValue + totalSellValue;
+    const buyDominance = totalValue > 0 ? totalBuyValue / totalValue : 0;
+
+    // Rising Star: bypass semua filter jika ada ledakan luar biasa
+    const isRisingStar = netInflow >= ANALYTICS.RISING_STAR_INFLOW_MIN
+                      && buyDominance >= ANALYTICS.RISING_STAR_DOMINANCE;
+
+    if (!isRisingStar) {
+      const thresh = this._getLiveThresholds(symbol, now, this._signalHistoryRebound);
+      if (totalValue < thresh.minValue)        return;
+      if (thresh.dailyValue < thresh.minDaily) return;
+    }
+
+    const highConfidence = isRisingStar || netInflow >= ANALYTICS.HIGH_CONFIDENCE_INFLOW;
+    const isLiquid       = totalValue >= ANALYTICS.LIVE_MIN_VALUE;
+    const isGembel       = lastTrade.price < 200;
+    const dStat          = this._dailyStats.get(symbol);
+
+    let emoji;
+    if (!history) {
+      emoji = isGembel ? '⭐️' : '💧';
+    } else if (history.hasDroppedBelow) {
+      emoji = '🥵';
+    } else {
+      emoji = (now - history.lastTime < 60_000) ? '🔥' : (isGembel ? '🌟' : '💦');
+    }
+
+    this._signalHistoryRebound.set(symbol, {
+      lastTime: now, lowAtSignal: sessionLow, hasDroppedBelow: false
+    });
+
+    this._emitSignal('LIVE_REBOUND', {
+      symbol, price: lastTrade.price, netInflow, totalValue,
+      emoji, isLiquid, isGembel, pctChange: lastTrade.pctChange,
+      smartMoneyTotal: dStat?.smartMoney || 0,
+      badMoneyTotal:   dStat?.badMoney   || 0,
+      highConfidence,
+    });
   }
 
   /**
@@ -629,57 +674,48 @@ class AnalyticsEngine extends EventEmitter {
     const recent = window.filter((t) => t.time >= cutoff);
     if (recent.length < 3) return;
 
-    // Filter: saham harus punya transaksi harian minimal
-    const dStat = this._dailyStats.get(symbol);
-    if (!dStat || dStat.totalValue < ANALYTICS.LIVE_DAILY_MIN_VALUE) return;
-
-    let totalBuyValue = 0;
-    let totalSellValue = 0;
-
+    let totalBuyValue = 0, totalSellValue = 0;
     for (const t of recent) {
       if (t.action === 1) totalBuyValue += t.value;
       else if (t.action === 2) totalSellValue += t.value;
     }
 
-    const netInflow = totalBuyValue - totalSellValue;
-    const totalValue = totalBuyValue + totalSellValue;
-    
+    const netInflow    = totalBuyValue - totalSellValue;
+    const totalValue   = totalBuyValue + totalSellValue;
     if (totalValue === 0) return;
     const sellDominance = totalSellValue / totalValue;
-    const isLiquid = totalValue >= ANALYTICS.LIVE_MIN_VALUE;
+    const isLiquid      = totalValue >= ANALYTICS.LIVE_MIN_VALUE;
 
-    // Filter: wajib liquid + threshold ketat
-    if (!isLiquid) return;
-    if (netInflow > -ANALYTICS.LIVE_NET_INFLOW_MIN) return;     // outflow harus cukup besar
-    if (sellDominance < ANALYTICS.LIVE_BUY_DOMINANCE) return;
+    // Rising Star (SELL side): bypass filter jika ada guyuran luar biasa
+    const isRisingStar = Math.abs(netInflow) >= ANALYTICS.RISING_STAR_INFLOW_MIN
+                      && sellDominance >= ANALYTICS.RISING_STAR_DOMINANCE;
 
-    const lastTrade = recent[recent.length - 1];
-    const isGembel = lastTrade.price < 200;
-    
-    const history = this._signalHistoryOutFlow.get(symbol);
-    let emoji = '';
-    
-    if (!history) {
-      emoji = isGembel ? '⭐️' : '💧';
-    } else {
-      const diff = now - history.lastTime;
-      if (diff < 60_000) emoji = '🔥';
-      else emoji = isGembel ? '🌟' : '💦';
+    if (!isRisingStar) {
+      const thresh = this._getLiveThresholds(symbol, now, this._signalHistoryOutFlow);
+      if (totalValue < thresh.minValue)          return;
+      if (netInflow > -thresh.minInflow)         return; // outflow harus cukup besar
+      if (sellDominance < thresh.minDominance)   return;
+      if (thresh.dailyValue < thresh.minDaily)   return;
     }
-    
+
+    const highConfidence = isRisingStar || Math.abs(netInflow) >= ANALYTICS.HIGH_CONFIDENCE_INFLOW;
+    const lastTrade      = recent[recent.length - 1];
+    const isGembel       = lastTrade.price < 200;
+    const dStat          = this._dailyStats.get(symbol);
+
+    const history = this._signalHistoryOutFlow.get(symbol);
+    let emoji = !history ? (isGembel ? '⭐️' : '💧')
+              : (now - history.lastTime < 60_000) ? '🔥'
+              : (isGembel ? '🌟' : '💦');
+
     this._signalHistoryOutFlow.set(symbol, { lastTime: now });
 
     this._emitSignal('LIVE_MF_MINUS', {
-      symbol: symbol,
-      price: lastTrade.price,
-      netInflow: netInflow,
-      totalValue: totalValue,
-      emoji: emoji,
-      isLiquid: isLiquid,
-      isGembel: isGembel,
-      pctChange: lastTrade.pctChange,
-      smartMoneyTotal: dStat.smartMoney,
-      badMoneyTotal: dStat.badMoney,
+      symbol, price: lastTrade.price, netInflow, totalValue,
+      emoji, isLiquid, isGembel, pctChange: lastTrade.pctChange,
+      smartMoneyTotal: dStat?.smartMoney || 0,
+      badMoneyTotal:   dStat?.badMoney   || 0,
+      highConfidence,
     });
   }
 

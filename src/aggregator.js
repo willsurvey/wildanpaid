@@ -97,10 +97,17 @@ class Aggregator {
       this._timers[type] = null;
     }
 
-    // Jika sudah menunggu terlalu lama (MAX_WAIT_MS), paksa flush sekarang
-    const elapsed = Date.now() - this._bufferStart[type];
-    const delay = elapsed >= AGG.MAX_WAIT_MS ? 0 : AGG.DEBOUNCE_MS;
+    // HIGH CONFIDENCE: flush segera tanpa menunggu debounce (real-time 0ms!)
+    // Trigger jika: Rising Star ATAU net inflow >= HIGH_CONFIDENCE_INFLOW
+    if (signal.highConfidence) {
+      log.info(`⚡ High Confidence [${type}] #${symbol} → flush segera`);
+      this._flush(type);
+      return;
+    }
 
+    // Normal: debounce + max-wait untuk batch
+    const elapsed = Date.now() - this._bufferStart[type];
+    const delay   = elapsed >= AGG.MAX_WAIT_MS ? 0 : AGG.DEBOUNCE_MS;
     this._timers[type] = setTimeout(() => this._flush(type), delay);
   }
 

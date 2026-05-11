@@ -138,7 +138,28 @@ const ANALYTICS = {
   // Minimum dominasi beli/jual
   LIVE_BUY_DOMINANCE: 0.65,            // 65%
   // Minimum total transaksi harian per saham (filter saham sepi)
-  LIVE_DAILY_MIN_VALUE: 5_000_000_000, // 5 Miliar
+  LIVE_DAILY_MIN_VALUE: 2_000_000_000,  // 2 Miliar (turun dari 5M agar catch mid-cap)
+
+  // --- SESSION PHASE THRESHOLDS ---
+  // Opening (09:00-09:30): skip filter harian, tapi window 60s lebih ketat
+  LIVE_OPENING_MIN_VALUE:   2_000_000_000,  // 2 Miliar — volatil, perlu bukti kuat
+  LIVE_OPENING_NET_INFLOW:  1_000_000_000,  // 1 Miliar
+
+  // Closing (14:30-15:00): sedikit lebih longgar karena volume biasa menurun
+  LIVE_CLOSING_MIN_VALUE:     750_000_000,  // 750 Juta
+  LIVE_CLOSING_NET_INFLOW:    375_000_000,  // 375 Juta
+  LIVE_CLOSING_DAILY_MIN:   1_000_000_000,  // 1 Miliar harian
+
+  // --- RISING STAR: bypass SEMUA filter jika ada ledakan luar biasa ---
+  // Saham baru, tidak punya daily value, tapi tiba-tiba dihajar besar
+  RISING_STAR_INFLOW_MIN:   2_000_000_000,  // 2 Miliar net inflow dalam 60s
+  RISING_STAR_DOMINANCE:           0.70,   // 70% dominasi beli/jual
+
+  // --- MOMENTUM CONTINUATION: saham sudah panas hari ini → threshold turun 50% ---
+  MOMENTUM_DISCOUNT:               0.50,   // Threshold × 0.5 jika sudah pernah signal
+
+  // --- HIGH CONFIDENCE: bypass debounce → kirim LANGSUNG (real-time!) ---
+  HIGH_CONFIDENCE_INFLOW:   1_500_000_000,  // 1.5 Miliar net inflow → high confidence
 };
 
 // ---------------------------------------------------------------------------
