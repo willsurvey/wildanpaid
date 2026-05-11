@@ -117,17 +117,42 @@ const ANALYTICS = {
   WHALE_SINGLE_TRADE_VALUE: 250_000_000,   // Rp 250 Juta
   WHALE_MEGA_TRADE_VALUE: 1_000_000_000,   // Rp 1 Miliar
 
-  // --- RAPID MOMENTUM ---
-  // Jendela waktu pendek: 10 detik terakhir
+  // --- RAPID MOMENTUM (dinonaktifkan — terlalu berisik) ---
+  RAPID_ENABLED: false,
   RAPID_WINDOW_MS: 10_000,
-  // Minimum frekuensi HK dalam jendela 10 detik
-  RAPID_MIN_FREQUENCY: 30,
+  RAPID_MIN_FREQUENCY: 80,            // Dinaikkan drastis jika ingin diaktifkan kembali
 
   // --- DISTRIBUTION WARNING ---
-  // Dominasi HAKI harus > 75%
   DISTRIBUTION_HAKI_DOMINANCE: 0.75,
-  // Total guyuran HAKI minimum Rp 2 Miliar dalam 1 menit
   DISTRIBUTION_MIN_VALUE: 2_000_000_000,
+
+  // --- WINDOWED ANALYSIS THROTTLE ---
+  // Throttle per-saham agar sinyal tidak meledak (5 detik, dari 2 detik)
+  WINDOWED_THROTTLE_MS: 5_000,
+
+  // --- LIVE SIGNALS (batch table) ---
+  // Minimum total nilai transaksi dalam window 60 detik
+  LIVE_MIN_VALUE: 1_000_000_000,       // 1 Miliar — wajib liquid
+  // Minimum net inflow/outflow agar dianggap signifikan
+  LIVE_NET_INFLOW_MIN: 500_000_000,    // 500 Juta
+  // Minimum dominasi beli/jual
+  LIVE_BUY_DOMINANCE: 0.65,            // 65%
+  // Minimum total transaksi harian per saham (filter saham sepi)
+  LIVE_DAILY_MIN_VALUE: 5_000_000_000, // 5 Miliar
+};
+
+// ---------------------------------------------------------------------------
+// Aggregator — Signal Router & Batch Table Builder
+// ---------------------------------------------------------------------------
+const AGGREGATOR = {
+  // Debounce: tunggu N ms setelah sinyal terakhir sebelum flush tabel
+  DEBOUNCE_MS: 500,
+
+  // Max tunggu sebelum paksa flush (hindari debounce infinite loop)
+  MAX_WAIT_MS: 2_000,
+
+  // Max baris per tabel yang dikirim ke Telegram
+  MAX_TABLE_ROWS: 20,
 };
 
 // ---------------------------------------------------------------------------
@@ -158,6 +183,10 @@ const TELEGRAM = {
   // Rate limit Telegram: max 30 pesan/detik ke grup
   // Kita batasi sendiri: max 1 pesan per 2 detik (sangat aman)
   MIN_SEND_INTERVAL_MS: 2_000,
+
+  // Max antrian untuk sinyal HIGH PRIORITY (WHALE, BSM, INSTITUTIONAL)
+  // Jika penuh dan sinyal baru masuk → buang yang paling lama
+  MAX_HP_QUEUE: 5,
 };
 
 // ---------------------------------------------------------------------------
@@ -171,4 +200,4 @@ const LOG = {
   SIGNAL_LOG_FILE: 'logs/signals.csv',
 };
 
-module.exports = { STOCKBIT, CONNECTION, ANALYTICS, TELEGRAM, LOG };
+module.exports = { STOCKBIT, CONNECTION, ANALYTICS, AGGREGATOR, TELEGRAM, LOG };

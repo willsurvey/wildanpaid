@@ -1,394 +1,233 @@
 // =============================================================================
-// NOTIFIER — Telegram Bot Alert Formatter & Sender
+// NOTIFIER — Telegram Alert Sender (Overhaul v2)
 // =============================================================================
-// Modul ini menerima sinyal dari Analytics Engine, memformat menjadi
-// pesan Telegram yang profesional, dan mengirimnya dengan proteksi:
-//   - Cooldown per saham (5 menit, agar tidak spam)
-//   - Rate limiting (max 1 pesan / 2 detik)
-//   - Antrian pesan (queue) agar tidak kehilangan sinyal saat rate-limited
-//   - Log sinyal ke file CSV untuk evaluasi/backtest
+// Dua jalur pengiriman:
+//   1. sendHighPriority(signal) — HP Queue (max 5), format individual
+//   2. sendTable(type, rows)    — Langsung kirim tabel rangkuman (no queue)
+//
+// Tidak ada queue utama. Tidak ada antrian ribuan pesan.
+// Sinyal lama dibuang jika queue HP penuh. Data selalu fresh.
 // =============================================================================
 
 const axios = require('axios');
-const fs = require('fs');
-const path = require('path');
+const fs    = require('fs');
+const path  = require('path');
 const { TELEGRAM, LOG } = require('./config');
 const { createLogger } = require('./logger');
 
 const log = createLogger('TELEGRAM');
 
+// Judul & thread ID per tipe batch
+const TABLE_META = {
+  LIVE_MONEY_FLOW: { title: '📈 LIVE MONEY INFLOW+',  topic: TELEGRAM.TOPICS.LIVE_MONEY    },
+  LIVE_GAIN:       { title: '🚀 LIVE GAIN',            topic: TELEGRAM.TOPICS.LIVE_GAIN     },
+  LIVE_REBOUND:    { title: '⚡ LIVE REBOUND',         topic: TELEGRAM.TOPICS.LIVE_REBOUND  },
+  LIVE_MF_MINUS:   { title: '📉 LIVE MONEY OUTFLOW-',  topic: TELEGRAM.TOPICS.LIVE_MF_MINUS },
+};
+
 class Notifier {
   constructor() {
-    // Cooldown tracker: Map<"TYPE:SYMBOL", timestamp_terakhir_alert>
-    this._cooldowns = new Map();
-
-    // Antrian pesan (FIFO)
-    this._queue = [];
-    this._isSending = false;
+    // HP Queue — sinyal penting (WHALE, BSM, INSTITUTIONAL, DISTRIBUTION)
+    this._hpQueue    = [];
+    this._isSending  = false;
 
     // Stats
-    this._stats = {
-      totalSent: 0,
-      totalBlocked: 0,
-      totalErrors: 0,
-    };
+    this._stats = { totalSent: 0, totalErrors: 0, totalDropped: 0 };
 
-    // Pastikan folder log ada
     this._ensureLogDir();
   }
 
   // -------------------------------------------------------------------------
-  // Public API
+  // Public: High Priority (individual format, HP queue max 5)
   // -------------------------------------------------------------------------
 
-  /**
-   * Proses sinyal dari Analytics Engine.
-   * Cek cooldown → format pesan → masukkan ke antrian.
-   * @param {Object} signal - { type, symbol, ...data }
-   */
-  handleSignal(signal) {
-    const { type, symbol } = signal;
-    const cooldownKey = `${type}:${symbol}`;
+  sendHighPriority(signal) {
+    const { message, threadId } = this._formatHP(signal);
+    if (!message) return;
 
-    // Cek cooldown
-    const lastAlert = this._cooldowns.get(cooldownKey) || 0;
-    const elapsed = Date.now() - lastAlert;
-
-    let cooldownLimit = TELEGRAM.COOLDOWN_MS;
-    if (['LIVE_MONEY_FLOW', 'LIVE_GAIN', 'LIVE_REBOUND', 'LIVE_MF_MINUS'].includes(type)) {
-      cooldownLimit = 10_000;
-    } else if (type === 'BIG_SMART_MONEY') {
-      cooldownLimit = 60_000; // 1 menit untuk BIG_SMART_MONEY
+    // Jika queue penuh → buang yang paling lama (keep newest)
+    if (this._hpQueue.length >= TELEGRAM.MAX_HP_QUEUE) {
+      this._hpQueue.shift();
+      this._stats.totalDropped++;
+      log.warn(`⚠️ HP Queue penuh — pesan lama dibuang (max: ${TELEGRAM.MAX_HP_QUEUE})`);
     }
 
-    if (elapsed < cooldownLimit) {
-      const remaining = ((cooldownLimit - elapsed) / 1000).toFixed(0);
-      log.debug(
-        `⏳ Cooldown aktif untuk ${cooldownKey} (${remaining}s tersisa)`
-      );
-      this._stats.totalBlocked++;
-      return;
-    }
-
-    // Set cooldown baru
-    this._cooldowns.set(cooldownKey, Date.now());
-
-    // Tentukan ID Topik (Thread ID)
-    let threadId = null;
-    let message = null;
-    switch (type) {
-      case 'INSTITUTIONAL_BUYING': 
-        threadId = TELEGRAM.TOPICS.INSTITUTIONAL; 
-        message = this._formatInstitutionalBuying(signal);
-        break;
-      case 'WHALE_BUY': 
-        threadId = TELEGRAM.TOPICS.WHALE; 
-        message = this._formatWhaleBuy(signal);
-        break;
-      case 'RAPID_MOMENTUM': 
-        threadId = TELEGRAM.TOPICS.MOMENTUM; 
-        message = this._formatRapidMomentum(signal);
-        break;
-      case 'DISTRIBUTION_WARNING': 
-        threadId = TELEGRAM.TOPICS.DISTRIBUTION; 
-        message = this._formatDistributionWarning(signal);
-        break;
-      case 'LIVE_MONEY_FLOW':
-        threadId = TELEGRAM.TOPICS.LIVE_MONEY;
-        message = this._formatLiveMoneyFlow(signal);
-        break;
-      case 'LIVE_GAIN':
-        threadId = TELEGRAM.TOPICS.LIVE_GAIN;
-        message = this._formatLiveGain(signal);
-        break;
-      case 'LIVE_REBOUND':
-        threadId = TELEGRAM.TOPICS.LIVE_REBOUND;
-        message = this._formatLiveRebound(signal);
-        break;
-      case 'LIVE_MF_MINUS':
-        threadId = TELEGRAM.TOPICS.LIVE_MF_MINUS;
-        message = this._formatLiveMoneyOutFlow(signal);
-        break;
-      case 'BIG_SMART_MONEY':
-        threadId = TELEGRAM.TOPICS.BIG_SMART_MONEY;
-        message = this._formatBigSmartMoney(signal);
-        break;
-      default:
-        log.warn(`⚠️ Tipe sinyal tidak dikenal: ${type}`);
-        return;
-    }
-
-    // Masukkan ke antrian (beserta threadId-nya)
-    this._queue.push({ message, threadId });
-    this._processQueue();
-
-    // Log ke CSV
+    this._hpQueue.push({ message, threadId });
+    this._processHPQueue();
     this._logSignalToCSV(signal);
   }
 
-  /**
-   * Ambil statistik notifier.
-   */
-  getStats() {
-    return {
-      ...this._stats,
-      queueLength: this._queue.length,
-      activeCooldowns: this._cooldowns.size,
-    };
+  // -------------------------------------------------------------------------
+  // Public: Batch Table (dari Aggregator, kirim langsung tanpa queue)
+  // -------------------------------------------------------------------------
+
+  async sendTable(type, rows) {
+    if (!rows || rows.length === 0) return;
+    const { message, threadId } = this._formatTable(type, rows);
+    if (!message) return;
+
+    try {
+      await this._sendToTelegram(message, threadId);
+      this._stats.totalSent++;
+      log.info(`📨 Tabel [${type}] terkirim (${rows.length} baris)`);
+    } catch (err) {
+      this._stats.totalErrors++;
+      // Jika rate limit Telegram, tunggu sekali lalu kirim lagi
+      if (err.response?.status === 429) {
+        const wait = (err.response?.data?.parameters?.retry_after || 5) * 1000;
+        log.warn(`⏳ Rate limit — retry tabel [${type}] dalam ${wait / 1000}s`);
+        await this._sleep(wait);
+        try {
+          await this._sendToTelegram(message, threadId);
+          this._stats.totalSent++;
+        } catch {
+          log.error(`❌ Tabel [${type}] gagal setelah retry — dibuang`);
+        }
+      } else {
+        log.error(`❌ Gagal kirim tabel [${type}]: ${err.message}`);
+      }
+    }
   }
 
   // -------------------------------------------------------------------------
-  // Private: Format Pesan Telegram
+  // Public: Stats
   // -------------------------------------------------------------------------
 
-  _formatInstitutionalBuying(s) {
-    const buyPct = (s.buyDominance * 100).toFixed(0);
+  getStats() {
+    return { ...this._stats, hpQueueLength: this._hpQueue.length };
+  }
+
+  // -------------------------------------------------------------------------
+  // Private: HP Queue Processor
+  // -------------------------------------------------------------------------
+
+  async _processHPQueue() {
+    if (this._isSending || this._hpQueue.length === 0) return;
+    this._isSending = true;
+
+    while (this._hpQueue.length > 0) {
+      const { message, threadId } = this._hpQueue.shift();
+      try {
+        await this._sendToTelegram(message, threadId);
+        this._stats.totalSent++;
+        log.info(`📨 HP Alert terkirim (sisa queue: ${this._hpQueue.length})`);
+      } catch (err) {
+        this._stats.totalErrors++;
+        if (err.response?.status === 429) {
+          const wait = (err.response?.data?.parameters?.retry_after || 5) * 1000;
+          log.warn(`⏳ HP rate limit — tunggu ${wait / 1000}s`);
+          await this._sleep(wait);
+          // Kembalikan ke depan antrian
+          this._hpQueue.unshift({ message, threadId });
+        } else {
+          log.error(`❌ Gagal kirim HP alert: ${err.message}`);
+        }
+      }
+      await this._sleep(TELEGRAM.MIN_SEND_INTERVAL_MS);
+    }
+
+    this._isSending = false;
+  }
+
+  // -------------------------------------------------------------------------
+  // Private: Format HP Signal (individual)
+  // -------------------------------------------------------------------------
+
+  _formatHP(signal) {
+    let message = null;
+    let threadId = null;
+
+    switch (signal.type) {
+      case 'INSTITUTIONAL_BUYING':
+        threadId = TELEGRAM.TOPICS.INSTITUTIONAL;
+        message  = this._fmtInstitutional(signal);
+        break;
+      case 'WHALE_BUY':
+        threadId = TELEGRAM.TOPICS.WHALE;
+        message  = this._fmtWhaleBuy(signal);
+        break;
+      case 'DISTRIBUTION_WARNING':
+        threadId = TELEGRAM.TOPICS.DISTRIBUTION;
+        message  = this._fmtDistribution(signal);
+        break;
+      case 'BIG_SMART_MONEY':
+        threadId = TELEGRAM.TOPICS.BIG_SMART_MONEY;
+        message  = this._fmtBigSmartMoney(signal);
+        break;
+      default:
+        log.warn(`⚠️ Format HP tidak dikenal: ${signal.type}`);
+    }
+
+    return { message, threadId };
+  }
+
+  _fmtInstitutional(s) {
+    const buyPct  = (s.buyDominance * 100).toFixed(0);
     const sellPct = (100 - s.buyDominance * 100).toFixed(0);
     const chgSign = s.pctChange >= 0 ? '+' : '';
-    const chgStr = `${chgSign}${s.pctChange.toFixed(1)}%`;
-    const entryStatus =
-      Math.abs(s.pctChange) <= 3
-        ? '✅ Aman Entry'
-        : Math.abs(s.pctChange) <= 5
-          ? '⚠️ Hati-hati'
-          : '❌ Terlalu Tinggi';
-
+    const entry   = Math.abs(s.pctChange) <= 3 ? '✅ Aman Entry'
+                  : Math.abs(s.pctChange) <= 5 ? '⚠️ Hati-hati'
+                  : '❌ Terlalu Tinggi';
     return (
       `🎯 *INSTITUTIONAL BUYING:* #${s.symbol}\n` +
       `━━━━━━━━━━━━━━━━━━━━\n` +
       `📊 *ORDER FLOW* (1 Menit Terakhir)\n` +
       `🟩 HK (Beli)  : Rp ${this._fmtRp(s.buyValue)} (${buyPct}%)\n` +
-      `🟥 HAKI (Jual) : Rp ${this._fmtRp(s.sellValue)} (${sellPct}%)\n` +
-      `⚖️ Net Inflow  : +Rp ${this._fmtRp(s.netInflow)}\n` +
-      `\n` +
-      `🐋 *FOOTPRINT* (Jejak Paus)\n` +
+      `🟥 HAKI (Jual): Rp ${this._fmtRp(s.sellValue)} (${sellPct}%)\n` +
+      `⚖️ Net Inflow  : +Rp ${this._fmtRp(s.netInflow)}\n\n` +
+      `🐋 *FOOTPRINT*\n` +
       `• ${s.whaleCount}x Block Trade (> Rp 250 Jt)\n` +
-      `• Frekuensi HK: ${s.buyFrequency}x Transaksi\n` +
-      `\n` +
-      `📈 *PRICE ACTION*\n` +
-      `• Harga : Rp ${s.price.toLocaleString('id-ID')}\n` +
-      `• Chg   : ${chgStr} (${entryStatus})\n` +
-      `\n` +
+      `• Frekuensi HK: ${s.buyFrequency}x Transaksi\n\n` +
+      `📈 Harga: Rp ${s.price.toLocaleString('id-ID')} (${chgSign}${s.pctChange.toFixed(1)}% — ${entry})\n\n` +
       `✅ *KESIMPULAN: STRONG ACCUMULATION*`
     );
   }
 
-  _formatWhaleBuy(s) {
+  _fmtWhaleBuy(s) {
     const emoji = s.tier === 'MEGA' ? '🐋🐋' : '🐋';
-    const tierLabel = s.tier === 'MEGA' ? 'MEGA WHALE' : 'BIG WHALE';
+    const label = s.tier === 'MEGA' ? 'MEGA WHALE' : 'BIG WHALE';
     const chgSign = s.pctChange >= 0 ? '+' : '';
-    const chgStr = `${chgSign}${s.pctChange.toFixed(1)}%`;
-
     return (
-      `${emoji} *${tierLabel} BUY:* #${s.symbol}\n` +
+      `${emoji} *${label} BUY:* #${s.symbol}\n` +
       `━━━━━━━━━━━━━━━━━━━━\n` +
-      `🔴 Harga  : Rp ${s.price.toLocaleString('id-ID')}\n` +
-      `📦 Lot    : ${s.lot.toLocaleString('id-ID')} Lot\n` +
-      `💸 Total  : Rp ${this._fmtRp(s.value)}\n` +
-      `📈 Chg    : ${chgStr}\n` +
-      `⏱ Waktu  : ${this._fmtTime(s.timestamp)}\n` +
-      `\n` +
+      `🔴 Harga : Rp ${s.price.toLocaleString('id-ID')}\n` +
+      `📦 Lot   : ${s.lot.toLocaleString('id-ID')} Lot\n` +
+      `💸 Total : Rp ${this._fmtRp(s.value)}\n` +
+      `📈 Chg   : ${chgSign}${s.pctChange.toFixed(1)}%\n` +
+      `⏱ Waktu : ${this._fmtTime(s.timestamp)}\n\n` +
       `_Terdeteksi 1x Hajar Kanan raksasa!_`
     );
   }
 
-  _formatRapidMomentum(s) {
-    return (
-      `⚡ *RAPID MOMENTUM:* #${s.symbol}\n` +
-      `━━━━━━━━━━━━━━━━━━━━\n` +
-      `🔥 Tape Speed: ${s.frequency}x HK dalam ${s.windowSeconds} Detik!\n` +
-      `\n` +
-      `📈 *DATA TRANSAKSI*\n` +
-      `• Harga Terakhir : Rp ${s.price.toLocaleString('id-ID')}\n` +
-      `• Akumulasi HK   : Rp ${this._fmtRp(s.totalValue)}\n` +
-      `\n` +
-      `⚠️ *KESIMPULAN: HIGH VOLATILITY (Scalping Only)*`
-    );
-  }
-
-  _formatDistributionWarning(s) {
+  _fmtDistribution(s) {
     const sellPct = (s.sellDominance * 100).toFixed(0);
-    const buyPct = (100 - s.sellDominance * 100).toFixed(0);
+    const buyPct  = (100 - s.sellDominance * 100).toFixed(0);
     const chgSign = s.pctChange >= 0 ? '+' : '';
-    const chgStr = `${chgSign}${s.pctChange.toFixed(1)}%`;
-
     return (
       `🚨 *DISTRIBUTION WARNING:* #${s.symbol}\n` +
       `━━━━━━━━━━━━━━━━━━━━\n` +
       `📉 *ORDER FLOW* (1 Menit Terakhir)\n` +
-      `🟥 HAKI (Guyur) : Rp ${this._fmtRp(s.sellValue)} (${sellPct}%)\n` +
-      `🟩 HK (Beli)    : Rp ${this._fmtRp(s.buyValue)} (${buyPct}%)\n` +
-      `⚖️ Net Outflow   : -Rp ${this._fmtRp(s.netOutflow)}\n` +
-      `\n` +
-      `📉 *PRICE ACTION*\n` +
-      `• Harga : Rp ${s.price.toLocaleString('id-ID')}\n` +
-      `• Chg   : ${chgStr} (Tekanan Jual Massive)\n` +
-      `\n` +
+      `🟥 HAKI (Guyur): Rp ${this._fmtRp(s.sellValue)} (${sellPct}%)\n` +
+      `🟩 HK (Beli)   : Rp ${this._fmtRp(s.buyValue)} (${buyPct}%)\n` +
+      `⚖️ Net Outflow  : -Rp ${this._fmtRp(s.netOutflow)}\n\n` +
+      `📉 Harga: Rp ${s.price.toLocaleString('id-ID')} (${chgSign}${s.pctChange.toFixed(1)}%)\n\n` +
       `❌ *KESIMPULAN: STRONG DISTRIBUTION (Hindari!)*`
     );
   }
 
-  _keterangan() {
-    return (
-      `\n━━━━━━━━━━━━━━━━━━━━\n` +
-      `*Keterangan :*\n` +
-      `💧  : signal pertama keluar\n` +
-      `🔥  : signal keluar lagi sblm 1 menit\n` +
-      `💦  : signal keluar lagi diatas 1 menit\n` +
-      `⭐️  : signal saham gembel pertama keluar\n` +
-      `🌟  : signal saham gembel keluar lagi diatas 1 menit\n` +
-      `🟢  : Saham Likuid\n` +
-      `🔴  : Saham Tidak Likuid\n` +
-      `MF+/- : Money InFlow/OutFlow`
-    );
-  }
-
-  _keteranganRebound() {
-    return (
-      `\n━━━━━━━━━━━━━━━━━━━━\n` +
-      `*Keterangan :*\n` +
-      `💧  : signal pertama keluar\n` +
-      `🔥  : signal keluar lagi sblm 1 menit\n` +
-      `💦  : signal keluar lagi diatas 1 menit\n` +
-      `⭐️  : signal saham gembel pertama keluar\n` +
-      `🌟  : signal saham gembel keluar lagi diatas 1 menit\n` +
-      `🥵  : Signal sudah keluar di rebound kemudian turun lagi dari low sebelumnya dan masuk lagi ke signal rebound\n` +
-      `🟢  : Saham Likuid\n` +
-      `🔴  : Saham Tidak Likuid\n` +
-      `MF+/- : Money InFlow/OutFlow`
-    );
-  }
-
-  _formatLiveMoneyFlow(s) {
-    const liqStr = s.isLiquid ? '🟢' : '🔴';
-    const chgSign = s.pctChange >= 0 ? '+' : '';
-    const chgStr = `${chgSign}${s.pctChange.toFixed(1)}%`;
-    const inFlowStr = s.netInflow > 0 ? '+Rp ' + this._fmtRp(s.netInflow) : '-Rp ' + this._fmtRp(Math.abs(s.netInflow));
-    
-    return (
-      `${s.emoji} *LIVE MONEY FLOW+:* #${s.symbol}\n` +
-      `━━━━━━━━━━━━━━━━━━━━\n` +
-      `📈 Harga     : Rp ${s.price.toLocaleString('id-ID')} (${chgStr})\n` +
-      `⚖️ Net Flow  : MF ${inFlowStr}\n` +
-      `💧 Likuiditas: ${liqStr}\n` +
-      this._keterangan() + `\n` +
-      `\n` +
-      `👨🏻‍💻 _This 🔥live Money InFlow created by Artificial Intelligence_\n` +
-      `#Disclaimer On\n` +
-      `\n` +
-      `*DISCLAIMER!!*\n` +
-      `1. Live Money Inflow adalah filter berdasarkan system trading base on Artificial Intelligence yang saya buat, dan ini hanya sebuah filter untuk mendapatkan data saham-saham yang tengah naik bukan ajakan membeli atau menjual, keputusan membeli dan menjual tetap ditangan Anda.\n` +
-      `2. Lakukan analisa kembali informasi yang kami berikan sesuai analisa masing - masing.\n` +
-      `3. Trading dan Investasi Saham memiliki potensi untung dan rugi, Manage your Own Risk.\n` +
-      `4. Ingat tidak ada yang bisa menjamin keuntungan ataupun kerugian dalam dunia investasi atau trading saham.\n` +
-      `5. Analisa kami bisa benar dan juga tentunya bisa salah, Ingat!! Market Always Right.\n` +
-      `6. Ingat!! Ingat!! Ingat!! apabila sebuah saham ramai NEWS POSITIF, itu artinya ada yang lagi butuh EXIT LIQUIDITY.\n` +
-      `7. Jangan terlalu GREEDY atau terlalu FEAR dan Jangan lupa selalu bersyukur.`
-    );
-  }
-
-  _formatLiveGain(s) {
-    const liqStr = s.isLiquid ? '🟢' : '🔴';
-    const chgSign = s.pctChange >= 0 ? '+' : '';
-    const chgStr = `${chgSign}${s.pctChange.toFixed(1)}%`;
-    const inFlowStr = s.netInflow > 0 ? '+Rp ' + this._fmtRp(s.netInflow) : '-Rp ' + this._fmtRp(Math.abs(s.netInflow));
-    
-    return (
-      `${s.emoji} *LIVE GAIN:* #${s.symbol}\n` +
-      `━━━━━━━━━━━━━━━━━━━━\n` +
-      `📈 Harga     : Rp ${s.price.toLocaleString('id-ID')} (${chgStr})\n` +
-      `⚖️ Net Flow  : MF ${inFlowStr}\n` +
-      `💧 Likuiditas: ${liqStr}\n` +
-      this._keterangan() + `\n` +
-      `\n` +
-      `👨🏻‍💻 _This 🔥live Gain created by Artificial Intelligence_\n` +
-      `#Disclaimer On\n` +
-      `\n` +
-      `*DISCLAIMER!!*\n` +
-      `1. Live gain adalah filter berdasarkan system trading base on Artificial Intelligence yang saya buat, dan ini hanya sebuah filter untuk mendapatkan data saham-saham yang tengah naik bukan ajakan membeli atau menjual, keputusan membeli dan menjual tetap ditangan Anda.\n` +
-      `2. Lakukan analisa kembali informasi yang kami berikan sesuai analisa masing - masing.\n` +
-      `3. Trading dan Investasi Saham memiliki potensi untung dan rugi, Manage your Own Risk.\n` +
-      `4. Ingat tidak ada yang bisa menjamin keuntungan ataupun kerugian dalam dunia investasi atau trading saham.\n` +
-      `5. Analisa kami bisa benar dan juga tentunya bisa salah, Ingat!! Market Always Right.\n` +
-      `6. ingat!! Ingat!! Ingat!! apabila sebuah saham ramai NEWS POSITIF, itu artinya ada yang lagi butuh EXIT LIQUIDITY.\n` +
-      `6. Jangan terlalu GREEDY atau terlalu FEAR dan Jangan lupa selalu bersyukur.`
-    );
-  }
-
-  _formatLiveRebound(s) {
-    const liqStr = s.isLiquid ? '🟢' : '🔴';
-    const chgSign = s.pctChange >= 0 ? '+' : '';
-    const chgStr = `${chgSign}${s.pctChange.toFixed(1)}%`;
-    const inFlowStr = s.netInflow > 0 ? '+Rp ' + this._fmtRp(s.netInflow) : '-Rp ' + this._fmtRp(Math.abs(s.netInflow));
-    
-    return (
-      `${s.emoji} *LIVE REBOUND:* #${s.symbol}\n` +
-      `━━━━━━━━━━━━━━━━━━━━\n` +
-      `📈 Harga     : Rp ${s.price.toLocaleString('id-ID')} (${chgStr})\n` +
-      `⚖️ Net Flow  : MF ${inFlowStr}\n` +
-      `💧 Likuiditas: ${liqStr}\n` +
-      this._keteranganRebound() + `\n` +
-      `\n` +
-      `👨🏻‍💻 _This 🔥live rebound created by Artificial Intelligence_\n` +
-      `#Disclaimer On\n` +
-      `\n` +
-      `*DISCLAIMER!!*\n` +
-      `1. Live Rebound adalah filter berdasarkan system trading base on Artificial Intelligence yang saya buat, dan ini hanya sebuah filter untuk mendapatkan data saham-saham yang tengah naik bukan ajakan membeli atau menjual, keputusan membeli dan menjual tetap ditangan Anda.\n` +
-      `2. Lakukan analisa kembali informasi yang kami berikan sesuai analisa masing - masing.\n` +
-      `3. Trading dan Investasi Saham memiliki potensi untung dan rugi, Manage your Own Risk.\n` +
-      `4. Ingat tidak ada yang bisa menjamin keuntungan ataupun kerugian dalam dunia investasi atau trading saham.\n` +
-      `5. Analisa kami bisa benar dan juga tentunya bisa salah, Ingat!! Market Always Right.\n` +
-      `6. ingat!! Ingat!! Ingat!! apabila sebuah saham ramai NEWS POSITIF, itu artinya ada yang lagi butuh EXIT LIQUIDITY.\n` +
-      `6. Jangan terlalu GREEDY atau terlalu FEAR dan Jangan lupa selalu bersyukur.`
-    );
-  }
-
-  _formatLiveMoneyOutFlow(s) {
-    const liqStr = s.isLiquid ? '🟢' : '🔴';
-    const chgSign = s.pctChange >= 0 ? '+' : '';
-    const chgStr = `${chgSign}${s.pctChange.toFixed(1)}%`;
-    const inFlowStr = s.netInflow > 0 ? '+Rp ' + this._fmtRp(s.netInflow) : '-Rp ' + this._fmtRp(Math.abs(s.netInflow));
-    
-    return (
-      `${s.emoji} *LIVE MF-:* #${s.symbol}\n` +
-      `━━━━━━━━━━━━━━━━━━━━\n` +
-      `📈 Harga     : Rp ${s.price.toLocaleString('id-ID')} (${chgStr})\n` +
-      `⚖️ Net Flow  : MF ${inFlowStr}\n` +
-      `💧 Likuiditas: ${liqStr}\n` +
-      this._keterangan() + `\n` +
-      `\n` +
-      `👨🏻‍💻 _This 🔥live Money OutFlow created by Artificial Intelligence_\n` +
-      `#Disclaimer On\n` +
-      `\n` +
-      `*DISCLAIMER!!*\n` +
-      `1. Live Money Outflow adalah filter berdasarkan system trading base on Artificial Intelligence yang saya buat, dan ini hanya sebuah filter untuk mendapatkan data saham-saham yang tengah naik bukan ajakan membeli atau menjual, keputusan membeli dan menjual tetap ditangan Anda.\n` +
-      `2. Lakukan analisa kembali informasi yang kami berikan sesuai analisa masing - masing.\n` +
-      `3. Trading dan Investasi Saham memiliki potensi untung dan rugi, Manage your Own Risk.\n` +
-      `4. Ingat tidak ada yang bisa menjamin keuntungan ataupun kerugian dalam dunia investasi atau trading saham.\n` +
-      `5. Analisa kami bisa benar dan juga tentunya bisa salah, Ingat!! Market Always Right.\n` +
-      `6. ingat!! Ingat!! Ingat!! apabila sebuah saham ramai NEWS POSITIF, itu artinya ada yang lagi butuh EXIT LIQUIDITY.\n` +
-      `6. Jangan terlalu GREEDY atau terlalu FEAR dan Jangan lupa selalu bersyukur.`
-    );
-  }
-
-  _formatBigSmartMoney(s) {
-    const liqStr = s.isLiquid ? '🟢' : '🔴';
-    
-    const fmtShort = (val) => {
-        const absVal = Math.abs(val);
-        const sign = val < 0 ? '-' : (val > 0 ? '+' : '');
-        if (absVal >= 1_000_000_000_000) return sign + (absVal/1e12).toFixed(2) + 'T';
-        if (absVal >= 1_000_000_000) return sign + (absVal/1e9).toFixed(2) + 'M';
-        if (absVal >= 1_000_000) return sign + (absVal/1e6).toFixed(1) + 'Jt';
-        return sign + (absVal/1e3).toFixed(1) + 'K';
+  _fmtBigSmartMoney(s) {
+    const fmtS = (v) => {
+      const a = Math.abs(v), sg = v < 0 ? '-' : v > 0 ? '+' : '';
+      if (a >= 1e12) return sg + (a/1e12).toFixed(2) + 'T';
+      if (a >= 1e9)  return sg + (a/1e9).toFixed(2) + 'M';
+      if (a >= 1e6)  return sg + (a/1e6).toFixed(1) + 'Jt';
+      return sg + (a/1e3).toFixed(1) + 'K';
     };
-
-    const chgSign = s.pctChange >= 0 ? '+' : '';
-    const cleanMoney = s.smartMoneyTotal - s.badMoneyTotal;
-    const totalMoney = s.smartMoneyTotal + s.badMoneyTotal;
-    const powerRatio = totalMoney > 0 ? (cleanMoney / totalMoney * 100).toFixed(2) : '0';
-    const status = cleanMoney > 0 ? '🟢 BUYER DOMINANT' : '🔴 SELLER DOMINANT';
-
+    const cleanMoney  = s.smartMoneyTotal - s.badMoneyTotal;
+    const totalMoney  = s.smartMoneyTotal + s.badMoneyTotal;
+    const powerRatio  = totalMoney > 0 ? (cleanMoney / totalMoney * 100).toFixed(2) : '0';
+    const status      = cleanMoney > 0 ? '🟢 BUYER DOMINANT' : '🔴 SELLER DOMINANT';
+    const chgSign     = s.pctChange >= 0 ? '+' : '';
     return (
       `🎯 *BIG SMART MONEY TRIGGER:* #${s.symbol}\n` +
       `━━━━━━━━━━━━━━━━━━━━\n` +
@@ -398,129 +237,125 @@ class Notifier {
       `💰 Value  : Rp ${this._fmtRp(s.valueWindow)}\n` +
       `⚖️ Avg MF : Rp ${this._fmtRp(s.avgMfWindow)}\n` +
       `📈 MF+    : +Rp ${this._fmtRp(s.netInflowWindow)}\n` +
-      `🚦 Volume : ${liqStr}🔥\n` +
-      `\n` +
-      `-----------------------------------\n` +
+      `🚦 Volume : ${s.isLiquid ? '🟢' : '🔴'}🔥\n\n` +
       `📊 MARKET ANALYST (09:00 - Now)\n` +
-      `👙 Smart Money : ${fmtShort(s.smartMoneyTotal)}\n` +
-      `🌪 Bad Money   : ${fmtShort(s.badMoneyTotal)}\n` +
-      `💰 Clean Money : ${fmtShort(cleanMoney)}\n` +
+      `👙 Smart Money : ${fmtS(s.smartMoneyTotal)}\n` +
+      `🌪 Bad Money   : ${fmtS(s.badMoneyTotal)}\n` +
+      `💰 Clean Money : ${fmtS(cleanMoney)}\n` +
       `⚖️ Status      : ${status}\n` +
-      `📈 Power Ratio : ${powerRatio}% (Clean/TotalVal)\n` +
-      `-----------------------------------`
+      `📈 Power Ratio : ${powerRatio}%`
     );
+  }
+
+  // -------------------------------------------------------------------------
+  // Private: Format Batch Table
+  // -------------------------------------------------------------------------
+
+  _formatTable(type, rows) {
+    const meta    = TABLE_META[type];
+    if (!meta) return { message: null, threadId: null };
+
+    const now     = new Date();
+    const dateStr = now.toLocaleDateString('id-ID', {
+      day: '2-digit', month: '2-digit', year: 'numeric',
+      timeZone: 'Asia/Jakarta'
+    }).replace(/\//g, '-');
+    const timeStr = now.toLocaleTimeString('id-ID', {
+      hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit',
+      timeZone: 'Asia/Jakarta'
+    });
+
+    const header =
+      `🗓${dateStr} \\|\\| ⏰${timeStr} WIB\n` +
+      `🟢 : Likuid    🔴 : Tidak Likuid\n` +
+      `\`====== ${meta.title} ======\`\n` +
+      `\`No  Saham  Harga   Chg%   MF(1m)   CM Hari  🚦\`\n`;
+
+    const lines = rows.map((s, i) => {
+      const liq   = s.isLiquid ? '🟢' : '🔴';
+      const chg   = `${s.pctChange >= 0 ? '+' : ''}${s.pctChange.toFixed(1)}%`;
+      const mf    = `${s.netInflow >= 0 ? '+' : ''}${this._fmtShort(s.netInflow)}`;
+      const cm    = s.smartMoneyTotal !== undefined
+                      ? this._fmtShort(s.smartMoneyTotal - s.badMoneyTotal)
+                      : 'N/A';
+      const no    = String(i + 1).padStart(2, ' ');
+      const sym   = s.symbol.padEnd(5, ' ');
+      const price = String(s.price.toLocaleString('id-ID')).padStart(7, ' ');
+      const chgP  = chg.padStart(6, ' ');
+      const mfP   = mf.padStart(8, ' ');
+      const cmP   = cm.padStart(8, ' ');
+      return `\`${no}. ${sym}${price} ${chgP} ${mfP} ${cmP} ${liq}\``;
+    });
+
+    const message = header + lines.join('\n');
+    return { message, threadId: meta.topic };
   }
 
   // -------------------------------------------------------------------------
   // Private: Telegram API
   // -------------------------------------------------------------------------
 
-  async _processQueue() {
-    if (this._isSending || this._queue.length === 0) return;
-    this._isSending = true;
-
-    while (this._queue.length > 0) {
-      const { message, threadId } = this._queue.shift();
-
-      try {
-        await this._sendToTelegram(message, threadId);
-        this._stats.totalSent++;
-        log.info(`📨 Alert terkirim (antrian: ${this._queue.length})`);
-      } catch (err) {
-        this._stats.totalErrors++;
-        log.error(`❌ Gagal kirim alert: ${err.message}`);
-
-        // Jika rate limited oleh Telegram, tunggu lebih lama
-        if (err.response?.status === 429) {
-          const retryAfter = err.response?.data?.parameters?.retry_after || 5;
-          log.warn(`⏳ Telegram rate limit — tunggu ${retryAfter}s`);
-          await this._sleep(retryAfter * 1000);
-          // Kembalikan pesan ke antrian
-          this._queue.unshift({ message, threadId });
-        }
-      }
-
-      // Rate limit internal: tunggu 2 detik antar pesan
-      await this._sleep(TELEGRAM.MIN_SEND_INTERVAL_MS);
-    }
-
-    this._isSending = false;
-  }
-
   async _sendToTelegram(text, threadId) {
-    const url = `${TELEGRAM.API_BASE}/bot${TELEGRAM.BOT_TOKEN}/sendMessage`;
+    const url     = `${TELEGRAM.API_BASE}/bot${TELEGRAM.BOT_TOKEN}/sendMessage`;
     const payload = {
-      chat_id: TELEGRAM.CHAT_ID,
-      text: text,
-      parse_mode: 'Markdown',
+      chat_id:                 TELEGRAM.CHAT_ID,
+      text:                    text,
+      parse_mode:              'Markdown',
       disable_web_page_preview: true,
     };
-
-    // Tambahkan threadId jika tersedia
     if (threadId && !isNaN(threadId)) {
       payload.message_thread_id = parseInt(threadId, 10);
     }
-
-    await axios.post(url, payload, {
-      timeout: 10_000,
-    });
+    await axios.post(url, payload, { timeout: 10_000 });
   }
 
   // -------------------------------------------------------------------------
-  // Private: Log Sinyal ke CSV
+  // Private: Log CSV
   // -------------------------------------------------------------------------
 
   _ensureLogDir() {
     const dir = path.dirname(LOG.SIGNAL_LOG_FILE);
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
-    }
-
-    // Tulis header CSV jika file belum ada
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
     if (!fs.existsSync(LOG.SIGNAL_LOG_FILE)) {
-      fs.writeFileSync(
-        LOG.SIGNAL_LOG_FILE,
-        'timestamp,type,symbol,price,value,pctChange,detail\n'
-      );
+      fs.writeFileSync(LOG.SIGNAL_LOG_FILE, 'timestamp,type,symbol,price,netInflow,pctChange\n');
     }
   }
 
   _logSignalToCSV(signal) {
     try {
       const line =
-        `${signal.timestamp.toISOString()},` +
-        `${signal.type},` +
-        `${signal.symbol},` +
-        `${signal.price || 0},` +
-        `${signal.value || signal.totalValue || signal.netInflow || 0},` +
-        `${signal.pctChange || 0},` +
-        `"${signal.message || ''}"\n`;
-
+        `${new Date().toISOString()},` +
+        `${signal.type},${signal.symbol},` +
+        `${signal.price || 0},${signal.netInflow || signal.value || 0},` +
+        `${signal.pctChange || 0}\n`;
       fs.appendFileSync(LOG.SIGNAL_LOG_FILE, line);
-    } catch {
-      // Jangan sampai gagal tulis log membuat seluruh sistem crash
-    }
+    } catch { /* jangan crash karena gagal tulis log */ }
   }
 
   // -------------------------------------------------------------------------
   // Private: Helpers
   // -------------------------------------------------------------------------
 
-  _fmtRp(value) {
-    if (value >= 1_000_000_000_000) return `${(value / 1e12).toFixed(1)} Triliun`;
-    if (value >= 1_000_000_000) return `${(value / 1e9).toFixed(1)} Miliar`;
-    if (value >= 1_000_000) return `${(value / 1e6).toFixed(0)} Juta`;
-    if (value >= 1_000) return `${(value / 1e3).toFixed(0)} Ribu`;
-    return `${value}`;
+  _fmtRp(v) {
+    if (v >= 1e12) return `${(v/1e12).toFixed(1)} Triliun`;
+    if (v >= 1e9)  return `${(v/1e9).toFixed(1)} Miliar`;
+    if (v >= 1e6)  return `${(v/1e6).toFixed(0)} Juta`;
+    if (v >= 1e3)  return `${(v/1e3).toFixed(0)} Ribu`;
+    return `${v}`;
+  }
+
+  _fmtShort(v) {
+    const a = Math.abs(v), sg = v < 0 ? '-' : v > 0 ? '+' : '';
+    if (a >= 1e12) return sg + (a/1e12).toFixed(1) + 'T';
+    if (a >= 1e9)  return sg + (a/1e9).toFixed(1)  + 'M';
+    if (a >= 1e6)  return sg + (a/1e6).toFixed(0)  + 'Jt';
+    return sg + (a/1e3).toFixed(0) + 'K';
   }
 
   _fmtTime(date) {
     if (!date) return '-';
     return date.toLocaleTimeString('id-ID', {
-      hour12: false,
-      hour: '2-digit',
-      minute: '2-digit',
-      second: '2-digit',
+      hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit',
       timeZone: 'Asia/Jakarta',
     }) + ' WIB';
   }

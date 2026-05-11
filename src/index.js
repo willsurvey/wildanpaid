@@ -11,9 +11,10 @@
 //   7. Tangani shutdown graceful (Ctrl+C, Docker stop)
 // =============================================================================
 
-const Streamer = require('./streamer');
+const Streamer        = require('./streamer');
 const AnalyticsEngine = require('./analytics');
-const Notifier = require('./notifier');
+const Notifier        = require('./notifier');
+const Aggregator      = require('./aggregator');
 const { createLogger } = require('./logger');
 const { startBSJPScheduler } = require('./bsjp-scheduler');
 const cron = require('node-cron');
@@ -40,21 +41,23 @@ async function main() {
   printBanner();
 
   // 1. Inisialisasi modul
-  const streamer = new Streamer();
-  const analytics = new AnalyticsEngine();
-  const notifier = new Notifier();
+  const streamer   = new Streamer();
+  const analytics  = new AnalyticsEngine();
+  const notifier   = new Notifier();
+  const aggregator = new Aggregator(notifier); // Aggregator butuh notifier
 
   // 2. Sambungkan pipeline event
-  //    Streamer --[trade]--> Analytics --[signal]--> Notifier
+  //    Streamer --[trade]--> Analytics --[signal]--> Aggregator ---> Notifier
+  //    HP signals (WHALE/BSM/INSTITUTIONAL): langsung ke Notifier
+  //    LIVE signals (MF+/GAIN/REBOUND/MF-): batch tabel 500ms debounce
   streamer.on('trade', (trade) => {
     analytics.processTrade(trade);
   });
 
   analytics.on('signal', (signal) => {
-    log.info(
-      `🚨 SINYAL: [${signal.type}] #${signal.symbol} — ${signal.message}`
-    );
-    notifier.handleSignal(signal);
+    // Log ringkas (hanya symbol & type, bukan full message agar log tidak banjir)
+    log.debug(`🚨 [${signal.type}] #${signal.symbol}`);
+    aggregator.route(signal);
   });
 
   // 3. Event handlers untuk monitoring
